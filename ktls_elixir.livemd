@@ -1,0 +1,177 @@
+# Kernel TLS with Elixir
+
+```elixir
+Mix.install([
+  {:hkdf, "~> 0.3.0"}
+])
+{:ok, _started} = :application.ensure_all_started(:ssl)
+:ok = :public_key.cacerts_load()
+```
+
+## The KTLS Module
+
+This module shows how to use Kernel TLS support on Linux to open a TLS connection and then communicate through it via a NIF-based `:socket` object (it could probably work for `:gen_tcp` as well), offloading the encryption and decryption to the kernel.
+
+It has a single public method that takes arguments similar to those of the
+[:ssl.connect/3](https://www.erlang.org/doc/apps/ssl/ssl.html#connect/3) function.
+
+It connects using the :ssl application and then does its first naughty thing - it deconstructs what should be an opaque term to obtain the underlying TCP port and the associated reader/writer pids of the SSL socket. It uses key logging support to get the client and server traffic secrets.
+
+It then does its second naughty thing - it calls the undocumented `:prim_inet.get_fd/1` function to
+get the underlying socket descriptor of the port and constructs a new socket via [:socket.open/2](https://www.erlang.org/doc/apps/kernel/socket.html#open/2).
+
+Its third (arguably) naughty thing is that it kills the underlying reader/writer pids of the original SSL socket, causing the closing of the TCP port, but we retain a reference to the underlying descriptor through our 'fd' initialized socket.
+
+```elixir
+defmodule KTLS do
+
+  @tls13 0x0304
+  @optlvl_tcp 6
+  @optlvl_tls 282
+  
+  @tcpopt_ulp 31
+  @tlsopt_tx 1
+  @tlsopt_rx 2
+
+  
+  def connect(host, port, opts) do
+    {ref, keylog_fn} = make_keylog_fn()
+
+    opts = Keyword.merge(opts, 
+      mode: :binary, 
+      active: false,
+      versions: [:"tlsv1.3"],
+      keep_secrets: {:keylog, keylog_fn})
+    
+    with {:ok, ssl_sock} <- :ssl.connect(host, port, opts),
+         {tcp_port, ssl_pids} = port_and_pids(ssl_sock),
+         {:ok, info} <- :ssl.connection_information(ssl_sock, [:selected_cipher_suite]),
+         [selected_cipher_suite: suite] = info do
+
+      secrets = fetch_logged_secrets(ref)
+      {_, client_secret} = Keyword.fetch!(secrets, :client)
+      {_, server_secret} = Keyword.fetch!(secrets, :server)
+
+      # Not a documented api!
+      {:ok, fd} = :prim_inet.getfd(tcp_port)
+
+      # Open a new socket and kill the pids of the ssl socket
+      {:ok, sock} = :socket.open(fd, %{domain: :inet, type: :stream, protocol: :tcp})
+      Enum.each(ssl_pids, &Process.exit(&1, :kill))
+      
+      :ok = set_tls_opts(sock, suite, client_secret, server_secret)
+      {:ok, sock}
+    end
+  end
+
+  # OTP 28
+  defp port_and_pids({:sslsocket, port, pid1, pid2, :gen_tcp, _, _, _}) do
+    {port, [pid1, pid2]}
+  end
+  # OTP 27
+  defp port_and_pids({:sslsocket, {:gen_tcp, port, _, _}, pids}) do
+    {port, pids}
+  end
+  
+  defp set_tls_opts(socket, suite, client_secret, server_secret) do
+    info = <<@tls13::16-native, cipher_code(suite.cipher)::16-native>>
+    client_opts = cipher_opts(suite, client_secret)
+    server_opts = cipher_opts(suite, server_secret)
+
+    :ok = :socket.setopt_native(socket, {@optlvl_tcp, @tcpopt_ulp}, "tls\0")
+    :ok = :socket.setopt_native(socket, {@optlvl_tls, @tlsopt_tx}, info <> client_opts)
+    :ok = :socket.setopt_native(socket, {@optlvl_tls, @tlsopt_rx}, info <> server_opts)
+  end
+
+  defp cipher_opts(%{cipher: cipher} = suite, secret) 
+      when cipher in [:aes_128_gcm, :aes_256_gcm] do
+    key_size = key_size(cipher)
+    {<<key::binary-size(key_size)>>, <<salt::binary-size(4), iv::binary-size(8)>>} =
+      extract_key_iv(suite, secret)
+    <<iv::binary, key::binary, salt::binary, 0::64>>
+  end
+
+  defp cipher_opts(%{cipher: :chacha20_poly1305} = suite, secret) do
+    key_size = key_size(:chacha20_poly1305)
+    {<<key::binary-size(key_size)>>, <<iv::binary-size(12)>>} =
+      extract_key_iv(suite, secret)
+    <<iv::binary, key::binary, 0::64>>
+  end
+  
+  defp tls13_hkdf_expand_label(prf, secret, label, context, length) do
+    hkdf_label = "tls13 " <> label
+    info = <<
+      length::16-big,
+      byte_size(hkdf_label)::8, hkdf_label::binary,
+      byte_size(context)::8, context::binary
+    >>
+    HKDF.expand(prf, secret, length, info)
+  end
+  
+  defp extract_key_iv(suite, secret) do
+    key_size = key_size(suite.cipher)
+    key = tls13_hkdf_expand_label(suite.prf, secret, "key", <<>>, key_size)
+    iv  = tls13_hkdf_expand_label(suite.prf, secret, "iv", <<>>, 12)
+    {key, iv}
+  end
+
+  defp fetch_logged_secrets(ref) do
+    Stream.unfold(ref, fn ref ->
+      receive do
+        {^ref, secret} ->
+          {[secret], ref}
+      after
+        0 -> nil
+      end
+    end)
+    |> Enum.to_list()
+    |> List.flatten()
+  end
+  
+  defp keylog(pid, ref, info) do
+    case info do
+      %{items: [~c"CLIENT_TRAFFIC_SECRET_0 " ++ rest]} ->
+        send(pid, {ref, {:client, parse_secret(to_string(rest))}})
+
+      %{items: [~c"SERVER_TRAFFIC_SECRET_0 " ++ rest]} ->
+        send(pid, {ref, {:server, parse_secret(to_string(rest))}})
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp parse_secret(secret) do
+    secret
+    |> String.split(" ", trim: true)
+    |> Enum.map(&:binary.decode_hex/1)
+    |> List.to_tuple()
+  end
+
+  defp make_keylog_fn() do
+    pid = self()
+    ref = make_ref()
+    {ref, &keylog(pid, ref, &1)}
+  end
+
+  defp key_size(:aes_128_gcm), do: 16
+  defp key_size(:aes_256_gcm), do: 32
+  defp key_size(:chacha20_poly1305), do: 32
+
+  # From <kernel/tls.h>
+  defp cipher_code(:aes_128_gcm), do: 51
+  defp cipher_code(:aes_256_gcm), do: 52
+  defp cipher_code(:chacha20_poly1305), do: 54
+end
+```
+
+```elixir
+# Create the socket
+{:ok, sock} = KTLS.connect(~c"google.com", 443, cacerts: :public_key.cacerts_get())
+```
+
+```elixir
+# Send and receive on the socket
+:ok = :socket.send(sock, "GET / HTTP/1.1\r\nHost: google.com\r\n\r\n")
+{:ok, resp} = :socket.recv(sock)
+```
